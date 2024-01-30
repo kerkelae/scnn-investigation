@@ -3,7 +3,9 @@ from dmipy.core import modeling_framework
 from dmipy.core.acquisition_scheme import gtab_dipy2dmipy
 from dmipy.distributions.distribute_models import BundleModel
 from dmipy.signal_models import cylinder_models, gaussian_models
+import nibabel as nib
 import numpy as np
+from scipy.ndimage import binary_erosion
 import torch
 
 
@@ -26,14 +28,6 @@ gtab = gradient_table(bvals, bvecs, small_delta=60e-3, big_delta=3)
 scheme = gtab_dipy2dmipy(gtab)
 
 
-# Test dataset
-
-signals = torch.load("../test_signals.pt")
-targets = torch.load("../test_targets.pt")
-data = signals.numpy()
-data = np.concatenate((np.ones((data.shape[0], 1)), data), axis=1)
-
-
 # Model definition
 
 stick = cylinder_models.C1Stick()
@@ -46,9 +40,58 @@ bundle.set_equal_parameter("G2Zeppelin_1_lambda_par", "C1Stick_1_lambda_par")
 mcdmi_mod = modeling_framework.MultiCompartmentSphericalMeanModel(models=[bundle])
 
 
-# Model fit
+# Real imaging data
 
-_ = mcdmi_mod.fit(scheme, data[0])  # compilation
+data_img = nib.load("../data/mri/preprocessed/sub-07/dwi.nii.gz")
+data = data_img.get_fdata()
+affine = data_img.affine
+mask = binary_erosion(
+    nib.load("../data/mri/preprocessed/sub-07/brain_mask.nii.gz")
+    .get_fdata()
+    .astype(bool),
+    iterations=2,
+)
+b0 = np.mean(
+    data[..., np.loadtxt("../data/mri/preprocessed/sub-01/dwi.bval") == 0], axis=-1
+)[..., np.newaxis]
+data = (
+    np.concatenate(
+        (b0, data[..., np.loadtxt("../data/mri/preprocessed/sub-01/dwi.bval") != 0]),
+        axis=-1,
+    )
+    / b0
+)
+data_masked = data[mask]
+
+mcdmi_fit = mcdmi_mod.fit(scheme, data_masked)
+mcmdi_csd_mod = modeling_framework.MultiCompartmentSphericalHarmonicsModel(
+    models=[bundle]
+)
+for name, value in mcdmi_fit.fitted_parameters.items():
+    mcmdi_csd_mod.set_fixed_parameter(name, value)
+mcmdi_csd_fit = mcmdi_csd_mod.fit(scheme, data_masked)
+preds_masked = np.concatenate(
+    (
+        mcmdi_csd_fit.fod_sh(),
+        (mcdmi_fit.fitted_parameters["BundleModel_1_G2Zeppelin_1_lambda_par"] * 1e9)[
+            :, np.newaxis
+        ],
+        mcdmi_fit.fitted_parameters["BundleModel_1_partial_volume_0"][:, np.newaxis],
+    ),
+    axis=1,
+)
+preds = np.zeros(mask.shape + (preds_masked.shape[-1],))
+preds[mask] = preds_masked
+nib.save(nib.Nifti1Image(preds, affine), "../smt_maps.nii.gz")
+
+
+# Test dataset
+
+signals = torch.load("../test_signals.pt")
+targets = torch.load("../test_targets.pt")
+data = signals.numpy()
+data = np.concatenate((np.ones((data.shape[0], 1)), data), axis=1)
+
 mcdmi_fit = mcdmi_mod.fit(scheme, data)
 mcmdi_csd_mod = modeling_framework.MultiCompartmentSphericalHarmonicsModel(
     models=[bundle]
